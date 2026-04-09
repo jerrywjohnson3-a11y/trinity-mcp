@@ -123,10 +123,29 @@ async function handleMcpRequest(body) {
   };
 }
 
-// Streamable HTTP MCP endpoint
+// Streamable HTTP MCP endpoint - GET for SSE session stream
+app.get('/mcp', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+  const sessionId = uuidv4();
+  res.write('event: open\ndata: {"sessionId":"' + sessionId + '"}\n\n');
+  const keepAlive = setInterval(function() { res.write(': ping\n\n'); }, 15000);
+  req.on('close', function() {
+    clearInterval(keepAlive);
+    if (global.mcpSessions) delete global.mcpSessions[sessionId];
+  });
+  if (!global.mcpSessions) global.mcpSessions = {};
+  global.mcpSessions[sessionId] = res;
+});
+
+// Streamable HTTP MCP endpoint - POST for requests
 app.post('/mcp', async (req, res) => {
   const accept = req.headers.accept || '';
   const body = req.body;
+  const sessionId = req.headers['mcp-session-id'];
 
   if (!Array.isArray(body)) {
     const result = await handleMcpRequest(body);
@@ -160,6 +179,16 @@ app.post('/mcp', async (req, res) => {
     return res.end();
   }
   res.json(results.length === 1 ? results[0] : results);
+});
+
+// DELETE for session cleanup
+app.delete('/mcp', (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  if (sessionId && global.mcpSessions && global.mcpSessions[sessionId]) {
+    global.mcpSessions[sessionId].end();
+    delete global.mcpSessions[sessionId];
+  }
+  res.status(200).end();
 });
 
 // Legacy SSE endpoint
