@@ -8,29 +8,28 @@ const PORT = process.env.PORT || 3000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const MODEL = 'arcee-ai/arcee-blitz';
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'ok', server: 'trinity-mcp' });
 });
 
-// Handle MCP JSON-RPC request
 async function handleMcpRequest(body) {
-  const { method, params, id } = body;
+  const { method, params, id, jsonrpc } = body;
+
+  // Notifications have no id - return null to signal no response needed
+  if (method && method.startsWith('notifications/')) {
+    return null;
+  }
 
   if (method === 'initialize') {
     return {
       jsonrpc: '2.0',
       id,
       result: {
-        protocolVersion: '2024-11-05',
+        protocolVersion: '2025-03-26',
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: 'trinity-mcp', version: '1.0.0' },
       },
     };
-  }
-
-  if (method === 'notifications/initialized') {
-    return { jsonrpc: '2.0', id, result: {} };
   }
 
   if (method === 'tools/list') {
@@ -55,7 +54,7 @@ async function handleMcpRequest(body) {
   }
 
   if (method === 'tools/call') {
-    const { name, arguments: args } = params;
+    const { name, arguments: args } = params || {};
     if (name === 'trinity_chat') {
       try {
         const messages = [];
@@ -89,15 +88,20 @@ async function handleMcpRequest(body) {
   return { jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } };
 }
 
-// Streamable HTTP MCP endpoint (Perplexity compatible)
+// Streamable HTTP MCP endpoint
 app.post('/mcp', async (req, res) => {
   const accept = req.headers.accept || '';
+  const body = req.body;
 
   // Handle single request
-  if (!Array.isArray(req.body)) {
-    const result = await handleMcpRequest(req.body);
+  if (!Array.isArray(body)) {
+    const result = await handleMcpRequest(body);
 
-    // If client accepts SSE, stream it
+    // Notification - no response needed, return 202
+    if (result === null) {
+      return res.status(202).end();
+    }
+
     if (accept.includes('text/event-stream')) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -105,18 +109,20 @@ app.post('/mcp', async (req, res) => {
         'Connection': 'keep-alive',
       });
       res.write(`event: message\ndata: ${JSON.stringify(result)}\n\n`);
-      res.end();
-    } else {
-      res.json(result);
+      return res.end();
     }
-    return;
+
+    return res.json(result);
   }
 
-  // Handle batch request
+  // Batch
   const results = [];
-  for (const item of req.body) {
-    results.push(await handleMcpRequest(item));
+  for (const item of body) {
+    const r = await handleMcpRequest(item);
+    if (r !== null) results.push(r);
   }
+
+  if (results.length === 0) return res.status(202).end();
 
   if (accept.includes('text/event-stream')) {
     res.writeHead(200, {
@@ -127,47 +133,36 @@ app.post('/mcp', async (req, res) => {
     for (const result of results) {
       res.write(`event: message\ndata: ${JSON.stringify(result)}\n\n`);
     }
-    res.end();
-  } else {
-    res.json(results);
+    return res.end();
   }
+
+  res.json(results.length === 1 ? results[0] : results);
 });
 
-// SSE endpoint for MCP (legacy)
+// SSE endpoint
 app.get('/sse', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
   });
-
   const sessionId = uuidv4();
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const host = req.headers.host;
-  const baseUrl = `${protocol}://${host}`;
-  res.write(`event: endpoint\ndata: ${baseUrl}/message?sessionId=${sessionId}\n\n`);
-
-  const keepAlive = setInterval(() => {
-    res.write(': ping\n\n');
-  }, 15000);
-
+  res.write(`event: endpoint\ndata: ${protocol}://${host}/message?sessionId=${sessionId}\n\n`);
+  const keepAlive = setInterval(() => res.write(': ping\n\n'), 15000);
   req.on('close', () => clearInterval(keepAlive));
-
   if (!global.sessions) global.sessions = {};
   global.sessions[sessionId] = res;
 });
 
-// Message endpoint for SSE transport
 app.post('/message', async (req, res) => {
   const result = await handleMcpRequest(req.body);
+  if (result === null) return res.status(202).end();
   const sessionId = req.query.sessionId;
   const sseRes = global.sessions?.[sessionId];
-  if (sseRes) {
-    sseRes.write(`event: message\ndata: ${JSON.stringify(result)}\n\n`);
-  }
+  if (sseRes) sseRes.write(`event: message\ndata: ${JSON.stringify(result)}\n\n`);
   res.json(result);
 });
 
-app.listen(PORT, () => {
-  console.log(`Trinity MCP server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Trinity MCP server running on port ${PORT}`));
