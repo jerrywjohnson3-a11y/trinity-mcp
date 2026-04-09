@@ -22,7 +22,10 @@ app.get('/sse', (req, res) => {
   });
 
   const sessionId = uuidv4();
-  res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
+  const protocol = req.headers['x-forwarded-proto'] || 'https';
+  const host = req.headers.host;
+  const baseUrl = `${protocol}://${host}`;
+  res.write(`event: endpoint\ndata: ${baseUrl}/message?sessionId=${sessionId}\n\n`);
 
   const keepAlive = setInterval(() => {
     res.write(': ping\n\n');
@@ -32,7 +35,6 @@ app.get('/sse', (req, res) => {
     clearInterval(keepAlive);
   });
 
-  // Store the response for this session
   if (!global.sessions) global.sessions = {};
   global.sessions[sessionId] = res;
 });
@@ -42,8 +44,16 @@ app.post('/message', async (req, res) => {
   const { method, params, id, jsonrpc } = req.body;
   const sessionId = req.query.sessionId;
 
+  // Send SSE event if session exists
+  const sendSSE = (data) => {
+    const sseRes = global.sessions?.[sessionId];
+    if (sseRes) {
+      sseRes.write(`event: message\ndata: ${JSON.stringify(data)}\n\n`);
+    }
+  };
+
   if (method === 'initialize') {
-    return res.json({
+    const result = {
       jsonrpc: '2.0',
       id,
       result: {
@@ -56,15 +66,19 @@ app.post('/message', async (req, res) => {
           version: '1.0.0',
         },
       },
-    });
+    };
+    sendSSE(result);
+    return res.json(result);
   }
 
   if (method === 'notifications/initialized') {
-    return res.json({ jsonrpc: '2.0', id, result: {} });
+    const result = { jsonrpc: '2.0', id, result: {} };
+    sendSSE(result);
+    return res.json(result);
   }
 
   if (method === 'tools/list') {
-    return res.json({
+    const result = {
       jsonrpc: '2.0',
       id,
       result: {
@@ -89,7 +103,9 @@ app.post('/message', async (req, res) => {
           },
         ],
       },
-    });
+    };
+    sendSSE(result);
+    return res.json(result);
   }
 
   if (method === 'tools/call') {
@@ -118,24 +134,30 @@ app.post('/message', async (req, res) => {
         const data = await response.json();
         const content = data.choices?.[0]?.message?.content || 'No response from Trinity';
 
-        return res.json({
+        const result = {
           jsonrpc: '2.0',
           id,
           result: {
             content: [{ type: 'text', text: content }],
           },
-        });
+        };
+        sendSSE(result);
+        return res.json(result);
       } catch (err) {
-        return res.json({
+        const errResult = {
           jsonrpc: '2.0',
           id,
           error: { code: -32000, message: err.message },
-        });
+        };
+        sendSSE(errResult);
+        return res.json(errResult);
       }
     }
   }
 
-  res.json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
+  const notFound = { jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } };
+  sendSSE(notFound);
+  res.json(notFound);
 });
 
 app.listen(PORT, () => {
