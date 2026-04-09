@@ -126,6 +126,7 @@ app.post('/mcp', async (req, res) => {
   const accept = req.headers.accept || '';
   const body = req.body;
   let sessionId = req.headers['mcp-session-id'];
+      console.log('POST /mcp', JSON.stringify({accept, body, sessionId}));
 
   // Create new session if none provided
   if (!sessionId) {
