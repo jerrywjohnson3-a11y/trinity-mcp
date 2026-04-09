@@ -27,7 +27,7 @@ async function handleMcpRequest(body) {
       jsonrpc: '2.0',
       id,
       result: {
-        protocolVersion: '2025-03-26',
+        protocolVersion: '2025-06-18',
         capabilities: {
           tools: { listChanged: false }
         },
