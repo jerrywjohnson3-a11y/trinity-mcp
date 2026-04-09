@@ -8,6 +8,9 @@ const PORT = process.env.PORT || 3000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const MODEL = 'arcee-ai/trinity-large-preview';
 
+// Session storage
+const sessions = {};
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', server: 'trinity-mcp' });
 });
@@ -66,7 +69,6 @@ async function handleMcpRequest(body) {
   if (method === 'tools/call') {
     const toolName = params && params.name;
     const args = params && params.arguments;
-
     if (toolName === 'ask_trinity') {
       try {
         const messages = [];
@@ -74,7 +76,6 @@ async function handleMcpRequest(body) {
           messages.push({ role: 'system', content: args.system_prompt });
         }
         messages.push({ role: 'user', content: args.question });
-
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
           method: 'POST',
           headers: {
@@ -86,10 +87,8 @@ async function handleMcpRequest(body) {
             messages: messages
           })
         });
-
         const data = await response.json();
         const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || 'No response from model';
-
         return {
           jsonrpc: '2.0',
           id,
@@ -108,7 +107,6 @@ async function handleMcpRequest(body) {
         };
       }
     }
-
     return {
       jsonrpc: '2.0',
       id,
@@ -123,42 +121,34 @@ async function handleMcpRequest(body) {
   };
 }
 
-// Streamable HTTP MCP endpoint - GET for SSE session stream
-app.get('/mcp', (req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-  });
-  const sessionId = uuidv4();
-  res.write('event: open\ndata: {"sessionId":"' + sessionId + '"}\n\n');
-  const keepAlive = setInterval(function() { res.write(': ping\n\n'); }, 15000);
-  req.on('close', function() {
-    clearInterval(keepAlive);
-    if (global.mcpSessions) delete global.mcpSessions[sessionId];
-  });
-  if (!global.mcpSessions) global.mcpSessions = {};
-  global.mcpSessions[sessionId] = res;
-});
-
-// Streamable HTTP MCP endpoint - POST for requests
+// Streamable HTTP MCP endpoint - POST
 app.post('/mcp', async (req, res) => {
   const accept = req.headers.accept || '';
   const body = req.body;
-  const sessionId = req.headers['mcp-session-id'];
+  let sessionId = req.headers['mcp-session-id'];
+
+  // Create new session if none provided
+  if (!sessionId) {
+    sessionId = uuidv4();
+    sessions[sessionId] = { created: Date.now() };
+  }
 
   if (!Array.isArray(body)) {
     const result = await handleMcpRequest(body);
-    if (result === null) return res.status(202).end();
-
+    if (result === null) {
+      res.setHeader('Mcp-Session-Id', sessionId);
+      return res.status(202).end();
+    }
     if (accept.includes('text/event-stream')) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache'
+        'Cache-Control': 'no-cache',
+        'Mcp-Session-Id': sessionId
       });
       res.write('event: message\ndata: ' + JSON.stringify(result) + '\n\n');
       return res.end();
     }
+    res.setHeader('Mcp-Session-Id', sessionId);
     return res.json(result);
   }
 
@@ -167,54 +157,51 @@ app.post('/mcp', async (req, res) => {
     const r = await handleMcpRequest(item);
     if (r !== null) results.push(r);
   }
-  if (results.length === 0) return res.status(202).end();
+  if (results.length === 0) {
+    res.setHeader('Mcp-Session-Id', sessionId);
+    return res.status(202).end();
+  }
   if (accept.includes('text/event-stream')) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache'
+      'Cache-Control': 'no-cache',
+      'Mcp-Session-Id': sessionId
     });
     for (const result of results) {
       res.write('event: message\ndata: ' + JSON.stringify(result) + '\n\n');
     }
     return res.end();
   }
+  res.setHeader('Mcp-Session-Id', sessionId);
   res.json(results.length === 1 ? results[0] : results);
+});
+
+// GET for SSE session stream
+app.get('/mcp', (req, res) => {
+  const sessionId = req.headers['mcp-session-id'] || uuidv4();
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Mcp-Session-Id': sessionId
+  });
+  res.write('event: open\ndata: {"sessionId":"' + sessionId + '"}\n\n');
+  const keepAlive = setInterval(function() { res.write(': ping\n\n'); }, 15000);
+  req.on('close', function() {
+    clearInterval(keepAlive);
+    delete sessions[sessionId];
+  });
+  sessions[sessionId] = { sseRes: res, created: Date.now() };
 });
 
 // DELETE for session cleanup
 app.delete('/mcp', (req, res) => {
   const sessionId = req.headers['mcp-session-id'];
-  if (sessionId && global.mcpSessions && global.mcpSessions[sessionId]) {
-    global.mcpSessions[sessionId].end();
-    delete global.mcpSessions[sessionId];
+  if (sessionId && sessions[sessionId]) {
+    if (sessions[sessionId].sseRes) sessions[sessionId].sseRes.end();
+    delete sessions[sessionId];
   }
   res.status(200).end();
-});
-
-// Legacy SSE endpoint
-app.get('/sse', (req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-  });
-  const sessionId = uuidv4();
-  const protocol = req.headers['x-forwarded-proto'] || 'https';
-  const host = req.headers.host;
-  res.write('event: endpoint\ndata: ' + protocol + '://' + host + '/message?sessionId=' + sessionId + '\n\n');
-  const keepAlive = setInterval(function() { res.write(': ping\n\n'); }, 15000);
-  req.on('close', function() { clearInterval(keepAlive); });
-  if (!global.sessions) global.sessions = {};
-  global.sessions[sessionId] = res;
-});
-
-app.post('/message', async (req, res) => {
-  const result = await handleMcpRequest(req.body);
-  if (result === null) return res.status(202).end();
-  const sessionId = req.query.sessionId;
-  var sseRes = global.sessions && global.sessions[sessionId];
-  if (sseRes) sseRes.write('event: message\ndata: ' + JSON.stringify(result) + '\n\n');
-  res.json(result);
 });
 
 app.listen(PORT, function() { console.log('Trinity MCP server running on port ' + PORT); });
